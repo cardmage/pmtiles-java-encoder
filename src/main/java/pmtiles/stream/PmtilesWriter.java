@@ -1,21 +1,15 @@
 package pmtiles.stream;
 
-import java.io.BufferedOutputStream;
 import java.io.Closeable;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -23,36 +17,40 @@ import java.util.Objects;
 /**
  * Streaming PMTiles v3 writer with bounded memory.
  *
- * <p>Tiles are written to disk as they arrive; directory entries are buffered in a fixed-size
- * chunk and spilled to temporary files, so heap usage does not grow with the number of tiles. No
- * MBTiles/SQLite intermediate is needed.
+ * <p>Tile bytes go to their final place in the archive as they arrive; directory entries are
+ * buffered in a fixed-size chunk and spilled to temporary files, so heap usage does not grow with
+ * the number of tiles. No MBTiles/SQLite intermediate and no staging copy of the tile data.
  *
- * <h2>Output modes</h2>
+ * <h2>Layout and targets</h2>
+ *
+ * <pre>
+ * | header | root | zero padding | tile data ... | leaf dirs | metadata |
+ * 0        127                   16384
+ * </pre>
+ *
+ * Tile data starts at byte 16384 and is written while tiles arrive. On {@link #finish()} the leaf
+ * directories and metadata are appended, then the first 16 KiB (header + root) is written last.
+ * Each archive byte is written exactly once. The length is {@code 16384 + tiles + leaves +
+ * metadata}, which {@code pmtiles verify} (go-pmtiles) accepts.
  *
  * <ul>
- *   <li>{@link Builder#open(Path)} &mdash; tile bytes go straight into the output file, starting
- *       at byte 16384. On {@link #finish()} leaf directories and metadata are appended and the
- *       header + root directory are written into the reserved first 16 KiB. Each tile byte is
- *       written exactly once.
- *   <li>{@link Builder#open(OutputStream)} &mdash; for non-seekable targets (S3 multipart upload,
- *       HTTP response, pipes). Tiles are staged in a temp file; {@link #finish()} streams header,
- *       root, metadata, leaves, then tile data in canonical order. If tiles arrived out of tile ID
- *       order, the tile data is reordered while copying so the result is still clustered.
+ *   <li>{@link Builder#open(Path)} &mdash; a local file; the head is written at offset 0 last.
+ *   <li>{@link Builder#open(MultipartUpload, int)} &mdash; an object store multipart upload (e.g.
+ *       S3). Parts 2, 3, ... are uploaded as they fill; part 1 (head + first tile bytes) is
+ *       uploaded last. Memory: two parts.
  * </ul>
  *
  * <h2>Ordering</h2>
  *
  * Tiles may be written in any order. Writing in ascending tile ID order (see {@link TileId}) is
- * cheapest and always yields a clustered archive. Out-of-order input is sorted with an external
- * merge sort; in {@code open(Path)} mode the archive is then valid but marked not clustered.
+ * cheapest and yields a clustered archive. Out-of-order input is sorted with an external merge
+ * sort; the archive is then valid but marked not clustered, because tile data is never moved.
  *
  * <h2>Lifecycle and failures</h2>
  *
- * Call {@link #finish()} to complete the archive. In {@code open(Path)} mode, {@link #close()}
- * without a successful {@code finish()} deletes the output, so an exception inside
- * try-with-resources never leaves a broken file behind. In {@code open(OutputStream)} mode nothing
- * is sent before {@code finish()}; if {@code finish()} itself fails part-way, the stream holds a
- * truncated archive and the caller must abort the upload or response.
+ * Call {@link #finish()} to complete the archive. {@link #close()} without a successful {@code
+ * finish()} deletes the output file or aborts the multipart upload, so an exception inside
+ * try-with-resources never leaves a broken archive behind.
  *
  * <pre>{@code
  * try (PmtilesWriter w = PmtilesWriter.builder()
@@ -75,18 +73,10 @@ public final class PmtilesWriter implements Closeable {
 
   private final Builder config;
   private final Codec codec;
-  private final Path outputPath; // file mode
-  private final OutputStream outputStream; // stream mode
   private final Path workDir;
   private final EntryStore entries;
   private final DedupCache dedup;
-  /**
-   * Stream mode: each offset that gets its first dedup hit, so tile data can be reordered at
-   * finish. Kept on disk; only read back if the input turned out to be unordered.
-   */
-  private final Path repeatedFile;
-  private final DataOutputStream repeatedLog;
-  private final RandomAccessFile data; // output file (file mode) or staged tiles (stream mode)
+  private final Sink sink;
 
   private final byte[] buffer = new byte[WRITE_BUFFER_BYTES];
   private int buffered;
@@ -115,42 +105,27 @@ public final class PmtilesWriter implements Closeable {
   private boolean closed;
   private WriteResult result;
 
-  private PmtilesWriter(Builder b, Path outputPath, OutputStream outputStream) throws IOException {
+  private interface SinkFactory {
+    Sink open() throws IOException;
+  }
+
+  private PmtilesWriter(Builder b, Path tempParent, SinkFactory sinkFactory) throws IOException {
     this.config = b.copy();
     this.codec = config.codecs.get(config.internalCompression);
     this.metadataJson = config.metadata;
-    this.outputPath = outputPath;
-    this.outputStream = outputStream;
-
-    Path tempParent = config.tempDirectory;
-    if (tempParent == null && outputPath != null) {
-      tempParent = outputPath.toAbsolutePath().getParent(); // spills are small in file mode
+    if (config.tempDirectory != null) {
+      tempParent = config.tempDirectory;
     }
     this.workDir =
         tempParent == null
             ? Files.createTempDirectory("pmtiles-writer-")
             : Files.createTempDirectory(tempParent, ".pmtiles-writer-");
-    this.repeatedFile = workDir.resolve("repeated.bin");
-    DataOutputStream log = null;
     try {
       this.entries = new EntryStore(workDir, config.sortChunkEntries);
       this.dedup = config.dedupCacheEntries > 0 ? new DedupCache(config.dedupCacheEntries) : null;
-      if (outputStream != null && dedup != null) {
-        log = EntryStore.openOut(repeatedFile, false);
-      }
-      this.repeatedLog = log;
       // opened last, so nothing can fail after the output file has been truncated
-      if (outputPath != null) {
-        this.data = new RandomAccessFile(outputPath.toFile(), "rw");
-        data.setLength(0);
-        data.seek(Header.ROOT_REGION);
-      } else {
-        this.data = new RandomAccessFile(workDir.resolve("tiles.bin").toFile(), "rw");
-      }
+      this.sink = sinkFactory.open();
     } catch (IOException | RuntimeException | Error e) {
-      if (log != null) {
-        log.close();
-      }
       deleteDirectory(workDir);
       throw e;
     }
@@ -189,14 +164,10 @@ public final class PmtilesWriter implements Closeable {
     synchronized (this) {
       checkWritable();
       try {
-        DedupCache.Slot hit = key == null ? null : dedup.get(key);
+        Long hit = key == null ? null : dedup.get(key);
         long offset;
         if (hit != null) {
-          offset = hit.offset;
-          if (repeatedLog != null && !hit.repeated) {
-            hit.repeated = true;
-            repeatedLog.writeLong(offset);
-          }
+          offset = hit;
         } else {
           offset = dataLength;
           append(tile);
@@ -253,13 +224,13 @@ public final class PmtilesWriter implements Closeable {
     }
   }
 
-  /** Appends at the end of the tile data; the file pointer stays there until finish(). */
+  /** Appends at the end of the tile data. */
   private void append(byte[] tile) throws IOException {
     if (tile.length > buffer.length - buffered) {
       flushBuffer();
     }
     if (tile.length > buffer.length) {
-      data.write(tile);
+      sink.write(tile, 0, tile.length);
     } else {
       System.arraycopy(tile, 0, buffer, buffered, tile.length);
       buffered += tile.length;
@@ -268,7 +239,7 @@ public final class PmtilesWriter implements Closeable {
   }
 
   private void flushBuffer() throws IOException {
-    data.write(buffer, 0, buffered);
+    sink.write(buffer, 0, buffered);
     buffered = 0;
   }
 
@@ -291,16 +262,10 @@ public final class PmtilesWriter implements Closeable {
     try {
       flushPending();
       flushBuffer();
-      if (repeatedLog != null) {
-        repeatedLog.close();
-      }
 
       boolean ordered = entries.isOrdered();
-      boolean reorder = outputStream != null && !ordered;
-      Path planFile = workDir.resolve("copy-plan.bin");
       EntryStore.Sorted sorted = entries.sorted();
-      EntryStore.Sorted finalEntries =
-          ordered ? sorted : finalizeEntries(sorted, reorder ? planFile : null);
+      EntryStore.Sorted finalEntries = ordered ? sorted : finalizeEntries(sorted);
 
       Path leavesFile = workDir.resolve("leaves.bin");
       DirectoryBuilder.Result dirs = DirectoryBuilder.build(finalEntries, codec, leavesFile);
@@ -311,21 +276,27 @@ public final class PmtilesWriter implements Closeable {
       h.internalCompression = config.internalCompression;
       h.tileCompression = config.tileCompression;
       h.tileType = config.tileType;
-      h.clustered = ordered || reorder;
+      h.clustered = ordered;
       h.addressedTiles = addressedTiles;
       h.tileEntries = finalEntries.count();
       h.tileContents = tileContents;
-      h.tileDataLength = dataLength;
       h.rootOffset = Header.LENGTH;
       h.rootLength = root.length;
-      h.metadataLength = meta.length;
+      h.tileDataOffset = Header.ROOT_REGION;
+      h.tileDataLength = dataLength;
+      h.leafDirectoriesOffset = h.tileDataOffset + dataLength;
       h.leafDirectoriesLength = dirs.leavesLength();
+      h.metadataOffset = h.leafDirectoriesOffset + h.leafDirectoriesLength;
+      h.metadataLength = meta.length;
       fillGeo(h);
 
-      long total =
-          outputPath != null
-              ? finishFile(h, root, meta, leavesFile)
-              : finishStream(h, root, meta, leavesFile, reorder ? planFile : null);
+      copyFile(leavesFile, h.leafDirectoriesLength);
+      sink.write(meta, 0, meta.length);
+      byte[] head = new byte[Header.ROOT_REGION];
+      System.arraycopy(h.toBytes(), 0, head, 0, Header.LENGTH);
+      System.arraycopy(root, 0, head, Header.LENGTH, root.length);
+      sink.finish(head);
+      long total = h.metadataOffset + meta.length;
       result =
           new WriteResult(
               addressedTiles,
@@ -351,20 +322,14 @@ public final class PmtilesWriter implements Closeable {
   }
 
   /**
-   * Single pass over sorted entries: rejects duplicate tiles, merges runs that became adjacent
-   * after sorting and, when {@code planFile != null}, assigns clustered offsets (first occurrence
-   * in tile ID order wins) and records which staged bytes to copy, in output order.
+   * Single pass over sorted entries: rejects duplicate tiles and merges runs that became adjacent
+   * after sorting. Offsets are unchanged; tile data is never moved.
    */
-  private EntryStore.Sorted finalizeEntries(EntryStore.Sorted sorted, Path planFile)
-      throws IOException {
-    // offset -> -1 until placed, then its new offset; only payloads that repeat are tracked
-    Map<Long, Long> placed = planFile == null ? null : readRepeatedOffsets();
+  private EntryStore.Sorted finalizeEntries(EntryStore.Sorted sorted) throws IOException {
     Path out = workDir.resolve("entries-final.bin");
     long count = 0;
-    long nextOffset = 0;
     try (EntryCursor c = sorted.open();
-        DataOutputStream o = EntryStore.openOut(out, false);
-        DataOutputStream plan = planFile == null ? null : EntryStore.openOut(planFile, false)) {
+        DataOutputStream o = EntryStore.openOut(out, false)) {
       boolean has = false;
       long t = 0;
       long off = 0;
@@ -377,20 +342,6 @@ public final class PmtilesWriter implements Closeable {
         int cr = c.runLength();
         if (has && ct < t + run) {
           throw new IllegalStateException("tile written more than once: " + TileId.toCoord(ct));
-        }
-        if (plan != null) {
-          Long newOffset = placed.get(co);
-          if (newOffset == null || newOffset == -1) {
-            if (newOffset != null) {
-              placed.put(co, nextOffset);
-            }
-            plan.writeLong(co);
-            plan.writeInt(cl);
-            co = nextOffset;
-            nextOffset += cl;
-          } else {
-            co = newOffset;
-          }
         }
         if (has && ct == t + run && co == off && cl == len && (long) run + cr <= Integer.MAX_VALUE) {
           run += cr;
@@ -413,69 +364,6 @@ public final class PmtilesWriter implements Closeable {
     }
     entries.deleteRuns();
     return new EntryStore.Sorted(List.of(new EntryStore.Run(out, count)), count);
-  }
-
-  private Map<Long, Long> readRepeatedOffsets() throws IOException {
-    Map<Long, Long> placed = new HashMap<>();
-    if (repeatedLog != null) {
-      long n = Files.size(repeatedFile) / Long.BYTES;
-      try (DataInputStream in = EntryStore.openIn(repeatedFile)) {
-        for (long i = 0; i < n; i++) {
-          placed.put(in.readLong(), -1L);
-        }
-      }
-    }
-    return placed;
-  }
-
-  /** Layout: header | root | [metadata] | gap | tile data @16384 | leaves | [metadata]. */
-  private long finishFile(Header h, byte[] root, byte[] meta, Path leavesFile) throws IOException {
-    long pos = Header.ROOT_REGION + dataLength;
-    h.tileDataOffset = Header.ROOT_REGION;
-    h.leafDirectoriesOffset = pos;
-    data.seek(pos);
-    copyFile(leavesFile, h.leafDirectoriesLength, asOutputStream(data));
-    pos += h.leafDirectoriesLength;
-    if (Header.LENGTH + (long) root.length + meta.length <= Header.ROOT_REGION) {
-      h.metadataOffset = Header.LENGTH + root.length; // tuck metadata into the reserved region
-    } else {
-      h.metadataOffset = pos;
-      pos += meta.length;
-    }
-    writeAt(h.metadataOffset, meta);
-    writeAt(Header.LENGTH, root);
-    writeAt(0, h.toBytes());
-    data.getFD().sync();
-    return pos;
-  }
-
-  /** Layout: header | root | metadata | leaves | tile data, streamed sequentially. */
-  private long finishStream(Header h, byte[] root, byte[] meta, Path leavesFile, Path planFile)
-      throws IOException {
-    h.metadataOffset = Header.LENGTH + root.length;
-    h.leafDirectoriesOffset = h.metadataOffset + meta.length;
-    h.tileDataOffset = h.leafDirectoriesOffset + h.leafDirectoriesLength;
-
-    // never closed: the caller owns outputStream
-    OutputStream out = new BufferedOutputStream(outputStream, 1 << 16);
-    out.write(h.toBytes());
-    out.write(root);
-    out.write(meta);
-    copyFile(leavesFile, h.leafDirectoriesLength, out);
-    if (planFile == null) {
-      copyData(0, dataLength, out);
-    } else {
-      try (DataInputStream plan = EntryStore.openIn(planFile)) {
-        for (long copied = 0; copied < dataLength; ) {
-          long from = plan.readLong();
-          int len = plan.readInt();
-          copyData(from, len, out);
-          copied += len;
-        }
-      }
-    }
-    out.flush();
-    return h.tileDataOffset + dataLength;
   }
 
   private void fillGeo(Header h) {
@@ -516,8 +404,7 @@ public final class PmtilesWriter implements Closeable {
 
   /**
    * Releases resources and deletes temp files. If {@link #finish()} has not completed
-   * successfully, an {@code open(Path)} output is deleted. Bytes a failed {@code finish()} already
-   * sent to an {@code open(OutputStream)} target cannot be recalled.
+   * successfully, the output file is deleted or the multipart upload is aborted.
    */
   @Override
   public synchronized void close() throws IOException {
@@ -526,27 +413,17 @@ public final class PmtilesWriter implements Closeable {
     }
     closed = true;
     try {
-      releaseResources();
-    } finally {
-      if (!finished && outputPath != null) {
-        Files.deleteIfExists(outputPath);
+      if (!finished) {
+        sink.abort();
       }
+    } finally {
+      releaseResources();
     }
   }
 
   /** Idempotent. */
   private void releaseResources() throws IOException {
-    try {
-      try {
-        if (repeatedLog != null) {
-          repeatedLog.close();
-        }
-      } finally {
-        data.close();
-      }
-    } finally {
-      deleteDirectory(workDir);
-    }
+    deleteDirectory(workDir);
   }
 
   private void checkWritable() {
@@ -564,51 +441,16 @@ public final class PmtilesWriter implements Closeable {
   // -----------------------------------------------------------------------------------------------
   // helpers
 
-  private void writeAt(long position, byte[] bytes) throws IOException {
-    data.seek(position);
-    data.write(bytes);
-  }
-
-  /**
-   * Copies {@code length} bytes of staged tile data starting at {@code position}. Uses positional
-   * channel reads (one syscall instead of seek + read per tile when reordering), so interrupting
-   * the thread inside {@link #finish()} aborts it; producer threads are unaffected.
-   */
-  private void copyData(long position, long length, OutputStream out) throws IOException {
-    while (length > 0) {
-      int n = (int) Math.min(buffer.length, length);
-      ByteBuffer chunk = ByteBuffer.wrap(buffer, 0, n);
-      while (chunk.hasRemaining()) {
-        if (data.getChannel().read(chunk, position + chunk.position()) < 0) {
-          throw new IOException("unexpected end of staged tile data");
-        }
-      }
-      out.write(buffer, 0, n);
-      position += n;
-      length -= n;
-    }
-  }
-
-  private static void copyFile(Path file, long length, OutputStream out) throws IOException {
+  /** Appends the leaf directories file to the archive; reuses the (flushed) write buffer. */
+  private void copyFile(Path file, long length) throws IOException {
     if (length > 0) { // leaves.bin only exists if leaf directories were built
       try (InputStream in = new FileInputStream(file.toFile())) {
-        in.transferTo(out);
+        int n;
+        while ((n = in.read(buffer)) > 0) {
+          sink.write(buffer, 0, n);
+        }
       }
     }
-  }
-
-  private static OutputStream asOutputStream(RandomAccessFile file) {
-    return new OutputStream() {
-      @Override
-      public void write(int b) throws IOException {
-        file.write(b);
-      }
-
-      @Override
-      public void write(byte[] b, int off, int len) throws IOException {
-        file.write(b, off, len);
-      }
-    };
   }
 
   /** The work directory is flat: spill files only. */
@@ -716,7 +558,10 @@ public final class PmtilesWriter implements Closeable {
       return this;
     }
 
-    /** Directory for spill files. Defaults to the output's directory, or java.io.tmpdir. */
+    /**
+     * Directory for spill files (24 bytes per directory entry, plus leaf directories; never tile
+     * data). Defaults to the output file's directory, or java.io.tmpdir for multipart uploads.
+     */
     public Builder tempDirectory(Path dir) {
       this.tempDirectory = dir;
       return this;
@@ -746,20 +591,32 @@ public final class PmtilesWriter implements Closeable {
       return this;
     }
 
-    /** Writes directly into a file. Existing content is overwritten. */
+    /**
+     * Writes directly into a file. Existing content is overwritten. Spill files go next to it
+     * unless {@link #tempDirectory} is set.
+     */
     public PmtilesWriter open(Path output) throws IOException {
       validate();
-      return new PmtilesWriter(this, Objects.requireNonNull(output), null);
+      Objects.requireNonNull(output);
+      return new PmtilesWriter(
+          this, output.toAbsolutePath().getParent(), () -> new Sink.FileSink(output));
     }
 
     /**
-     * Writes to a non-seekable stream. Nothing is written until {@link #finish()}; the stream is
-     * flushed but not closed. If {@code finish()} fails part-way, the stream may hold a truncated
-     * archive, so abort the upload or response in that case.
+     * Uploads to an object store multipart upload (e.g. S3) while tiles are written; no local copy
+     * of the tile data. Holds two parts in memory. The archive can be at most 10,000 parts.
+     *
+     * @param partSize bytes per part; S3 requires at least 5 MiB (5,242,880) and allows at most
+     *     5 GiB. The maximum archive size is {@code 10,000 × partSize}: 8 MiB parts allow about
+     *     80 GB.
      */
-    public PmtilesWriter open(OutputStream output) throws IOException {
+    public PmtilesWriter open(MultipartUpload upload, int partSize) throws IOException {
       validate();
-      return new PmtilesWriter(this, null, Objects.requireNonNull(output));
+      Objects.requireNonNull(upload);
+      if (partSize <= Header.ROOT_REGION) {
+        throw new IllegalArgumentException("partSize must be larger than " + Header.ROOT_REGION);
+      }
+      return new PmtilesWriter(this, null, () -> new Sink.MultipartSink(upload, partSize));
     }
 
     private void validate() {
