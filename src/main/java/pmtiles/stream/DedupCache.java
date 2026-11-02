@@ -16,16 +16,6 @@ final class DedupCache {
 
   record Key(long hi, long lo, int length) {}
 
-  /** Where identical content was written, and whether it has been reused before. */
-  static final class Slot {
-    final long offset;
-    boolean repeated;
-
-    Slot(long offset) {
-      this.offset = offset;
-    }
-  }
-
   private static final ThreadLocal<MessageDigest> SHA256 =
       ThreadLocal.withInitial(
           () -> {
@@ -36,13 +26,13 @@ final class DedupCache {
             }
           });
 
-  private final LinkedHashMap<Key, Slot> map;
+  private final LinkedHashMap<Key, Long> map;
 
   DedupCache(int maxEntries) {
     this.map =
         new LinkedHashMap<>(Math.min(maxEntries, 1 << 16) * 2, 0.75f, true) {
           @Override
-          protected boolean removeEldestEntry(Map.Entry<Key, Slot> eldest) {
+          protected boolean removeEldestEntry(Map.Entry<Key, Long> eldest) {
             return size() > maxEntries;
           }
         };
@@ -61,12 +51,12 @@ final class DedupCache {
     return new Key(hi, lo, data.length);
   }
 
-  /** Identical content already written, or null. */
-  Slot get(Key key) {
+  /** Offset of identical content already written, or null. */
+  Long get(Key key) {
     return map.get(key);
   }
 
   void put(Key key, long offset) {
-    map.put(key, new Slot(offset));
+    map.put(key, offset);
   }
 }

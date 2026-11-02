@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -23,6 +22,9 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
 class PmtilesWriterTest {
+
+  /** Small, so multipart tests upload many parts. */
+  private static final int PART_SIZE = 64 * 1024;
 
   // ---------------------------------------------------------------------------------------------
   // helpers
@@ -92,6 +94,19 @@ class PmtilesWriterTest {
     assertEquals(r.dataLength, end, "tile data fully referenced");
   }
 
+  /**
+   * File mode: header | root | padding | tiles @16384 | leaves | metadata. The total length must
+   * be 16384 + metadata + leaves + tiles, which is what {@code pmtiles verify} (go-pmtiles) checks.
+   */
+  private static void assertFileModeLayout(TestReader r, Path out) throws IOException {
+    assertEquals(127, r.rootOffset);
+    assertEquals(16384, r.dataOffset);
+    assertEquals(r.dataOffset + r.dataLength, r.leafOffset);
+    assertEquals(r.leafOffset + r.leafLength, r.metadataOffset);
+    assertEquals(r.metadataOffset + r.metadataLength, Files.size(out));
+    assertEquals(16384 + r.metadataLength + r.leafLength + r.dataLength, Files.size(out));
+  }
+
   private static void assertNoTempFilesLeft(Path dir, Path... expected) throws IOException {
     try (Stream<Path> s = Files.list(dir)) {
       List<Path> left = s.filter(p -> !List.of(expected).contains(p)).toList();
@@ -137,7 +152,7 @@ class PmtilesWriterTest {
       assertEquals(-85.0511287, r.minLat, 1e-6);
       assertEquals(16384, r.dataOffset);
       assertEquals("{\"name\":\"test\",\"vector_layers\":[]}", r.metadata());
-      assertTrue(r.metadataOffset < 16384, "small metadata stored in reserved region");
+      assertFileModeLayout(r, out); // small metadata also goes at the end, not into the 16 KiB
       assertAllTiles(r, ids);
       assertClusteredLayout(r);
       assertNull(r.getTile(7, 0, 0));
@@ -168,6 +183,7 @@ class PmtilesWriterTest {
       assertEquals(ids.size(), r.addressedTiles);
       assertEquals(ids.size(), r.allTileEntries().size());
       assertAllTiles(r, ids);
+      assertFileModeLayout(r, out);
       assertNoTempFilesLeft(dir, out);
     } finally {
       deleteTree(dir);
@@ -175,29 +191,125 @@ class PmtilesWriterTest {
   }
 
   @Test
-  void rowMajorInputToStreamIsReclustered() throws IOException {
+  void multipartUploadIsByteIdenticalToFile() throws IOException {
+    List<Long> shuffled = idsUpTo(7);
+    Collections.shuffle(shuffled, new Random(7));
+    List<List<Long>> inputs = List.of(idsUpTo(1), idsUpTo(7), rowMajor(7), shuffled);
+    // archive smaller than one part, a few parts, many parts
+    int[] partSizes = {1 << 20, 64 * 1024, Header.ROOT_REGION + 1};
+    for (List<Long> ids : inputs) {
+      Path dir = tempDir();
+      try {
+        Path out = dir.resolve("out.pmtiles");
+        try (PmtilesWriter w = PmtilesWriter.builder().sortChunkEntries(1000).open(out)) {
+          for (long id : ids) {
+            w.writeTileId(id, id % 7 == 0 ? new byte[] {7} : content(id)); // some dedup
+          }
+          w.finish();
+        }
+        byte[] expected = Files.readAllBytes(out);
+        for (int partSize : partSizes) {
+          MemoryUpload up = new MemoryUpload();
+          WriteResult res;
+          try (PmtilesWriter w =
+              PmtilesWriter.builder()
+                  .tempDirectory(dir)
+                  .sortChunkEntries(1000)
+                  .openMultipart(up, partSize, 0)) {
+            for (long id : ids) {
+              w.writeTileId(id, id % 7 == 0 ? new byte[] {7} : content(id));
+            }
+            res = w.finish();
+          }
+          String label = ids.size() + " tiles, partSize " + partSize;
+          assertArrayEquals(expected, up.object(), label);
+          assertEquals(expected.length, res.totalBytes(), label);
+          assertEquals(1, up.order.get(up.order.size() - 1), "part 1 uploaded last: " + label);
+          assertFalse(up.aborted, label);
+          assertNoTempFilesLeft(dir, out);
+        }
+      } finally {
+        deleteTree(dir);
+      }
+    }
+  }
+
+  @Test
+  void multipartUploadIsAbortedWhenNotFinished() throws IOException {
     Path dir = tempDir();
     try {
-      List<Long> ids = rowMajor(7);
-      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      MemoryUpload up = new MemoryUpload();
       try (PmtilesWriter w =
-          PmtilesWriter.builder().tempDirectory(dir).sortChunkEntries(1000).open(bytes)) {
-        for (long id : ids) {
-          w.writeTileId(id, content(id));
+          PmtilesWriter.builder()
+              .tempDirectory(dir)
+              .openMultipart(up, Header.ROOT_REGION + 1, 0)) {
+        byte[] padding = new byte[8192];
+        for (long id : idsUpTo(4)) {
+          w.writeTileId(id, concat(content(id), padding));
         }
-        WriteResult res = w.finish();
-        assertTrue(res.clustered());
-        assertEquals(bytes.size(), res.totalBytes());
       }
-      TestReader r = new TestReader(bytes.toByteArray());
-      assertTrue(r.clustered);
-      assertEquals(127, r.rootOffset);
-      assertEquals(r.rootOffset + r.rootLength, r.metadataOffset);
-      assertEquals(r.metadataOffset + r.metadataLength, r.leafOffset);
-      assertEquals(r.leafOffset + r.leafLength, r.dataOffset);
-      assertEquals(bytes.size(), r.dataOffset + r.dataLength);
-      assertAllTiles(r, ids);
-      assertClusteredLayout(r);
+      // only two part buffers exist, so most of the ~170 parts were uploaded before close()
+      assertFalse(up.parts.isEmpty(), "parts are uploaded while tiles are written");
+      assertTrue(up.aborted);
+      assertFalse(up.completed);
+      assertNoTempFilesLeft(dir);
+    } finally {
+      deleteTree(dir);
+    }
+  }
+
+  @Test
+  void multipartOpenFailureAbortsTheUpload() throws IOException {
+    Path dir = tempDir();
+    try {
+      MemoryUpload tooSmall = new MemoryUpload();
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> PmtilesWriter.builder().open(tooSmall, PmtilesWriter.MIN_PART_SIZE - 1));
+      assertTrue(tooSmall.aborted, "S3 minimum part size is enforced before uploading anything");
+
+      MemoryUpload tooLarge = new MemoryUpload();
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> PmtilesWriter.builder().open(tooLarge, PmtilesWriter.MAX_PART_SIZE + 1));
+      assertTrue(tooLarge.aborted);
+
+      MemoryUpload noTempDir = new MemoryUpload();
+      assertThrows(
+          IOException.class,
+          () ->
+              PmtilesWriter.builder()
+                  .tempDirectory(dir.resolve("missing"))
+                  .open(noTempDir, PmtilesWriter.MIN_PART_SIZE));
+      assertTrue(noTempDir.aborted);
+      assertTrue(noTempDir.parts.isEmpty());
+    } finally {
+      deleteTree(dir);
+    }
+  }
+
+  @Test
+  void failedPartUploadFailsTheWriterAndAbortsOnClose() throws IOException {
+    Path dir = tempDir();
+    try {
+      MemoryUpload up = new MemoryUpload();
+      up.failOnPart = 3;
+      PmtilesWriter w =
+          PmtilesWriter.builder().tempDirectory(dir).openMultipart(up, Header.ROOT_REGION + 1, 0);
+      IOException e =
+          assertThrows(
+              IOException.class,
+              () -> {
+                for (long id : idsUpTo(7)) {
+                  w.writeTileId(id, content(id));
+                }
+                w.finish();
+              });
+      assertTrue(e.getMessage().contains("part 3"), e.getMessage());
+      assertThrows(IllegalStateException.class, () -> w.write(0, 0, 0, new byte[] {1}));
+      w.close();
+      assertTrue(up.aborted);
+      assertFalse(up.completed);
       assertNoTempFilesLeft(dir);
     } finally {
       deleteTree(dir);
@@ -206,7 +318,7 @@ class PmtilesWriterTest {
 
   @Test
   void deduplicatesAndRunLengthEncodesRepeatedTiles() throws IOException {
-    for (boolean stream : new boolean[] {false, true}) {
+    for (boolean multipart : new boolean[] {false, true}) {
       for (boolean shuffle : new boolean[] {false, true}) {
         Path dir = tempDir();
         try {
@@ -220,22 +332,22 @@ class PmtilesWriterTest {
             Collections.shuffle(ids, new Random(3));
           }
           Path out = dir.resolve("out.pmtiles");
-          ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+          MemoryUpload up = new MemoryUpload();
           PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir);
           WriteResult res;
-          try (PmtilesWriter w = stream ? b.open(bytes) : b.open(out)) {
+          try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
             for (long id : ids) {
               w.writeTileId(id, (id - start) % 100 == 0 ? content(id) : ocean);
             }
             res = w.finish();
           }
-          TestReader r = stream ? new TestReader(bytes.toByteArray()) : new TestReader(out);
-          String label = "stream=" + stream + " shuffle=" + shuffle;
+          TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
+          String label = "multipart=" + multipart + " shuffle=" + shuffle;
           assertEquals(20_000, r.addressedTiles, label);
           assertEquals(201, r.tileContents, label); // 200 unique + 1 ocean
           assertEquals(400, r.tileEntries, label); // 200 unique + 200 ocean runs after each
           assertEquals(400, r.allTileEntries().size(), label);
-          assertEquals(!shuffle || stream, r.clustered, label);
+          assertEquals(!shuffle, r.clustered, label);
           assertEquals(res.tileEntries(), r.tileEntries);
           for (long id : ids) {
             byte[] expected = (id - start) % 100 == 0 ? content(id) : ocean;
@@ -257,7 +369,7 @@ class PmtilesWriterTest {
     try {
       List<Long> ids = idsUpTo(9); // 349,525 tiles
       Collections.shuffle(ids, new Random(11));
-      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      MemoryUpload up = new MemoryUpload();
       WriteResult res;
       // tiny chunks -> ~350 sorted runs -> exceeds merge fan-in and forces intermediate merges
       try (PmtilesWriter w =
@@ -265,20 +377,19 @@ class PmtilesWriterTest {
               .tempDirectory(dir)
               .sortChunkEntries(1000)
               .dedupCacheEntries(0)
-              .open(bytes)) {
+              .openMultipart(up, PART_SIZE, 0)) {
         for (long id : ids) {
           w.writeTileId(id, content(id));
         }
         res = w.finish();
       }
-      TestReader r = new TestReader(bytes.toByteArray());
+      TestReader r = new TestReader(up.object());
       assertTrue(res.leafDirectories() > 0);
       assertEquals(res.leafDirectories(), r.leafDirectoryCount());
       assertTrue(r.rootLength <= 16384 - 127);
       assertEquals(ids.size(), r.addressedTiles);
       assertEquals(ids.size(), r.allTileEntries().size());
-      assertTrue(r.clustered);
-      assertClusteredLayout(r);
+      assertFalse(r.clustered);
       assertAllTiles(r, ids);
       assertNoTempFilesLeft(dir);
     } finally {
@@ -302,7 +413,7 @@ class PmtilesWriterTest {
       TestReader r = new TestReader(out);
       assertTrue(res.leafDirectories() > 0);
       assertTrue(r.clustered);
-      assertEquals(r.dataOffset + r.dataLength, r.leafOffset);
+      assertFileModeLayout(r, out);
       assertAllTiles(r, ids);
       assertClusteredLayout(r);
     } finally {
@@ -327,7 +438,7 @@ class PmtilesWriterTest {
         w.finish();
       }
       TestReader r = new TestReader(out);
-      assertTrue(r.metadataOffset >= r.dataOffset + r.dataLength);
+      assertFileModeLayout(r, out);
       assertEquals(json.toString(), r.metadata());
     } finally {
       deleteTree(dir);
@@ -336,20 +447,20 @@ class PmtilesWriterTest {
 
   @Test
   void uncompressedInternals() throws IOException {
-    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    MemoryUpload up = new MemoryUpload();
     Path dir = tempDir();
     try {
       try (PmtilesWriter w =
           PmtilesWriter.builder()
               .tempDirectory(dir)
               .internalCompression(Compression.NONE)
-              .open(bytes)) {
+              .openMultipart(up, PART_SIZE, 0)) {
         for (long id : idsUpTo(4)) {
           w.writeTileId(id, content(id));
         }
         w.finish();
       }
-      TestReader r = new TestReader(bytes.toByteArray());
+      TestReader r = new TestReader(up.object());
       assertEquals(Compression.NONE.value(), r.internalCompression);
       assertAllTiles(r, idsUpTo(4));
       assertEquals("{}", r.metadata());
@@ -445,12 +556,20 @@ class PmtilesWriterTest {
 
   @Test
   void concurrentWritersProduceCompleteArchive() throws Exception {
+    for (boolean multipart : new boolean[] {false, true}) {
+      concurrentWriters(multipart);
+    }
+  }
+
+  private void concurrentWriters(boolean multipart) throws Exception {
     Path dir = tempDir();
     ExecutorService pool = Executors.newFixedThreadPool(4);
     try {
       Path out = dir.resolve("out.pmtiles");
       List<Long> ids = idsUpTo(8);
-      try (PmtilesWriter w = PmtilesWriter.builder().sortChunkEntries(5000).open(out)) {
+      MemoryUpload up = new MemoryUpload();
+      PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir).sortChunkEntries(5000);
+      try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
         List<Future<?>> futures = new ArrayList<>();
         for (int t = 0; t < 4; t++) {
           int shard = t;
@@ -469,7 +588,7 @@ class PmtilesWriterTest {
         }
         w.finish();
       }
-      TestReader r = new TestReader(out);
+      TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
       assertEquals(ids.size(), r.addressedTiles);
       assertAllTiles(r, ids);
     } finally {
@@ -480,7 +599,7 @@ class PmtilesWriterTest {
 
   @Test
   void tilesLargerThanWriteBufferAndDeepZooms() throws IOException {
-    for (boolean stream : new boolean[] {false, true}) {
+    for (boolean multipart : new boolean[] {false, true}) {
       Path dir = tempDir();
       try {
         Random rnd = new Random(9);
@@ -489,16 +608,16 @@ class PmtilesWriterTest {
         byte[] small = {42};
         int max = Integer.MAX_VALUE; // x/y limit at zoom 31
         Path out = dir.resolve("out.pmtiles");
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        MemoryUpload up = new MemoryUpload();
         PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir);
-        try (PmtilesWriter w = stream ? b.open(bytes) : b.open(out)) {
+        try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
           w.write(31, max, max, small);
           w.write(3, 1, 2, big);
           w.write(31, 0, 0, big); // dedup of a large tile
           w.write(20, 1000, 2000, small);
           w.finish();
         }
-        TestReader r = stream ? new TestReader(bytes.toByteArray()) : new TestReader(out);
+        TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
         assertArrayEquals(big, r.getTile(3, 1, 2));
         assertArrayEquals(big, r.getTile(31, 0, 0));
         assertArrayEquals(small, r.getTile(31, max, max));
@@ -514,24 +633,28 @@ class PmtilesWriterTest {
 
   @Test
   void interruptedWriterThreadDoesNotBreakTheArchive() throws IOException {
-    for (boolean stream : new boolean[] {false, true}) {
+    for (boolean multipart : new boolean[] {false, true}) {
       Path dir = tempDir();
       try {
-        List<Long> ids = rowMajor(8); // unordered: exercises spills, merge and reordering
-        byte[] padding = new byte[4096]; // pushes data past the 1 MiB write buffer
+        List<Long> ids = rowMajor(8); // unordered: exercises spills and merge
+        byte[] padding = new byte[4096]; // pushes data past the 1 MiB file buffer
         Path out = dir.resolve("out.pmtiles");
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        MemoryUpload up = new MemoryUpload();
         PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir).sortChunkEntries(500);
-        try (PmtilesWriter w = stream ? b.open(bytes) : b.open(out)) {
+        try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
           Thread.currentThread().interrupt(); // producer interrupted, e.g. a cancelled task
           for (long id : ids) {
             byte[] c = content(id);
             w.writeTileId(id, id % 1000 == 0 ? concat(c, padding) : c);
           }
+          w.finish(); // still interrupted: finish() must not fail either
           assertTrue(Thread.interrupted(), "interrupt flag preserved");
-          w.finish(); // documented: interrupting finish() itself may abort it
         }
-        TestReader r = stream ? new TestReader(bytes.toByteArray()) : new TestReader(out);
+        if (multipart) {
+          assertFalse(
+              up.callers.contains(Thread.currentThread()), "uploads never run on the producer");
+        }
+        TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
         assertEquals(ids.size(), r.addressedTiles);
         for (long id : ids) {
           byte[] c = content(id);
@@ -549,37 +672,6 @@ class PmtilesWriterTest {
     System.arraycopy(a, 0, out, 0, a.length);
     System.arraycopy(b, 0, out, a.length, b.length);
     return out;
-  }
-
-  @Test
-  void dedupHitsBeforeInputTurnsUnorderedAreStillReclustered() throws IOException {
-    Path dir = tempDir();
-    try {
-      byte[] same = "same".getBytes(StandardCharsets.US_ASCII);
-      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-      try (PmtilesWriter w = PmtilesWriter.builder().tempDirectory(dir).open(bytes)) {
-        w.writeTileId(10, same); // written
-        w.writeTileId(11, content(11));
-        w.writeTileId(20, same); // dedup hit while input is still ordered
-        w.writeTileId(30, content(30));
-        w.writeTileId(5, same); // input turns unordered; 5 now comes first in tile ID order
-        w.writeTileId(3, content(3));
-        WriteResult res = w.finish();
-        assertTrue(res.clustered());
-        assertEquals(4, res.tileContents());
-      }
-      TestReader r = new TestReader(bytes.toByteArray());
-      assertClusteredLayout(r);
-      for (long id : new long[] {5, 10, 20}) {
-        assertArrayEquals(same, r.getTile(id));
-      }
-      for (long id : new long[] {3, 11, 30}) {
-        assertArrayEquals(content(id), r.getTile(id));
-      }
-      assertEquals(4, r.tileContents);
-    } finally {
-      deleteTree(dir);
-    }
   }
 
   @Test
