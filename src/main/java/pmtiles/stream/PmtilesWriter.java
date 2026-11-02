@@ -36,8 +36,8 @@ import java.util.Objects;
  * <ul>
  *   <li>{@link Builder#open(Path)} &mdash; a local file; the head is written at offset 0 last.
  *   <li>{@link Builder#open(MultipartUpload, int)} &mdash; an object store multipart upload (e.g.
- *       S3). Parts 2, 3, ... are uploaded as they fill; part 1 (head + first tile bytes) is
- *       uploaded last. Memory: two parts.
+ *       S3). Parts 2, 3, ... are uploaded on a background thread as they fill; part 1 (head + first
+ *       tile bytes) is uploaded last. Memory: three parts.
  * </ul>
  *
  * <h2>Ordering</h2>
@@ -64,12 +64,17 @@ import java.util.Objects;
  * }</pre>
  *
  * <p>All methods are thread-safe; content hashing for deduplication runs outside the lock.
- * Writing uses {@code java.io} streams, which unlike NIO channels are not closed when a producer
- * thread is interrupted (e.g. a cancelled task), so one interrupt cannot destroy the archive.
+ * Interrupting a producer thread (e.g. a cancelled task) does not break the archive: files are
+ * written with {@code java.io} streams, which unlike NIO channels are not closed by an interrupt,
+ * and multipart parts are uploaded on the writer's own thread.
  */
 public final class PmtilesWriter implements Closeable {
 
-  private static final int WRITE_BUFFER_BYTES = 1 << 20;
+  /** S3's minimum size for every part except the last. */
+  static final int MIN_PART_SIZE = 5 << 20;
+
+  /** Three parts are held in memory, so keep them well below the array size limit. */
+  static final int MAX_PART_SIZE = 1 << 30;
 
   private final Builder config;
   private final Codec codec;
@@ -78,8 +83,6 @@ public final class PmtilesWriter implements Closeable {
   private final DedupCache dedup;
   private final Sink sink;
 
-  private final byte[] buffer = new byte[WRITE_BUFFER_BYTES];
-  private int buffered;
   private long dataLength;
   private String metadataJson;
 
@@ -224,23 +227,10 @@ public final class PmtilesWriter implements Closeable {
     }
   }
 
-  /** Appends at the end of the tile data. */
+  /** Appends at the end of the tile data; the sink does its own buffering. */
   private void append(byte[] tile) throws IOException {
-    if (tile.length > buffer.length - buffered) {
-      flushBuffer();
-    }
-    if (tile.length > buffer.length) {
-      sink.write(tile, 0, tile.length);
-    } else {
-      System.arraycopy(tile, 0, buffer, buffered, tile.length);
-      buffered += tile.length;
-    }
+    sink.write(tile, 0, tile.length);
     dataLength += tile.length;
-  }
-
-  private void flushBuffer() throws IOException {
-    sink.write(buffer, 0, buffered);
-    buffered = 0;
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -261,7 +251,6 @@ public final class PmtilesWriter implements Closeable {
     }
     try {
       flushPending();
-      flushBuffer();
 
       boolean ordered = entries.isOrdered();
       EntryStore.Sorted sorted = entries.sorted();
@@ -314,7 +303,7 @@ public final class PmtilesWriter implements Closeable {
       throw e;
     }
     try {
-      releaseResources();
+      deleteDirectory(workDir);
     } catch (IOException e) {
       // the archive is complete; close() retries the cleanup and reports the error
     }
@@ -417,13 +406,8 @@ public final class PmtilesWriter implements Closeable {
         sink.abort();
       }
     } finally {
-      releaseResources();
+      deleteDirectory(workDir);
     }
-  }
-
-  /** Idempotent. */
-  private void releaseResources() throws IOException {
-    deleteDirectory(workDir);
   }
 
   private void checkWritable() {
@@ -441,9 +425,10 @@ public final class PmtilesWriter implements Closeable {
   // -----------------------------------------------------------------------------------------------
   // helpers
 
-  /** Appends the leaf directories file to the archive; reuses the (flushed) write buffer. */
+  /** Appends the leaf directories file to the archive. */
   private void copyFile(Path file, long length) throws IOException {
     if (length > 0) { // leaves.bin only exists if leaf directories were built
+      byte[] buffer = new byte[1 << 16];
       try (InputStream in = new FileInputStream(file.toFile())) {
         int n;
         while ((n = in.read(buffer)) > 0) {
@@ -604,19 +589,41 @@ public final class PmtilesWriter implements Closeable {
 
     /**
      * Uploads to an object store multipart upload (e.g. S3) while tiles are written; no local copy
-     * of the tile data. Holds two parts in memory. The archive can be at most 10,000 parts.
+     * of the tile data. The writer owns {@code upload} from here on: it is completed by {@link
+     * #finish()} and aborted by {@link #close()} without a successful finish, or by this method
+     * if opening fails.
      *
-     * @param partSize bytes per part; S3 requires at least 5 MiB (5,242,880) and allows at most
-     *     5 GiB. The maximum archive size is {@code 10,000 × partSize}: 8 MiB parts allow about
-     *     80 GB.
+     * <p>Uploads run on a dedicated thread, so producers are not blocked by the network unless
+     * they outpace it. Holds three parts in memory.
+     *
+     * @param partSize bytes per part, from 5 MiB (S3's minimum) to 1 GiB. The archive can have at
+     *     most 10,000 parts, so the maximum size is {@code 10,000 × partSize}: 16 MiB parts allow
+     *     about 160 GB.
      */
     public PmtilesWriter open(MultipartUpload upload, int partSize) throws IOException {
-      validate();
+      return openMultipart(upload, partSize, MIN_PART_SIZE);
+    }
+
+    /** {@link #open(MultipartUpload, int)} with a lower minimum, so tests can use tiny parts. */
+    PmtilesWriter openMultipart(MultipartUpload upload, int partSize, int minPartSize)
+        throws IOException {
       Objects.requireNonNull(upload);
-      if (partSize <= Header.ROOT_REGION) {
-        throw new IllegalArgumentException("partSize must be larger than " + Header.ROOT_REGION);
+      try {
+        validate();
+        if (partSize < Math.max(minPartSize, Header.ROOT_REGION + 1)
+            || partSize > MAX_PART_SIZE) {
+          throw new IllegalArgumentException(
+              "partSize must be between " + minPartSize + " and " + MAX_PART_SIZE);
+        }
+        return new PmtilesWriter(this, null, () -> new Sink.MultipartSink(upload, partSize));
+      } catch (IOException | RuntimeException | Error e) {
+        try {
+          upload.abort(); // nothing else will: no writer was returned to close
+        } catch (IOException | RuntimeException abortError) {
+          e.addSuppressed(abortError);
+        }
+        throw e;
       }
-      return new PmtilesWriter(this, null, () -> new Sink.MultipartSink(upload, partSize));
     }
 
     private void validate() {

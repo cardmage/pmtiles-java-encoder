@@ -3,6 +3,7 @@ package pmtiles.stream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
@@ -12,12 +13,13 @@ import java.nio.file.Path;
  *
  * <p>args: output maxZoom (hilbert|rowmajor) (file|multipart)
  *
- * <p>{@code multipart} simulates an S3 multipart upload with 8 MiB parts: each part is written to
+ * <p>{@code multipart} simulates an S3 multipart upload with 5 MiB parts: each part is written to
  * the output file at the position S3 would place it, so the result can be checked like a file.
  */
 public final class BoundedMemoryDemo {
 
-  private static final int PART_SIZE = 8 << 20;
+  /** 5 MiB, S3's minimum: the writer holds 3 parts, 15 MiB of heap. */
+  private static final int PART_SIZE = PmtilesWriter.MIN_PART_SIZE;
 
   public static void main(String[] args) throws Exception {
     Path out = Path.of(args[0]);
@@ -74,9 +76,11 @@ public final class BoundedMemoryDemo {
 
   /** Places part n at (n - 1) * PART_SIZE, as an object store would when assembling parts. */
   private static final class FileParts implements MultipartUpload, AutoCloseable {
+    private final Path path;
     private final RandomAccessFile file;
 
     FileParts(Path path) throws IOException {
+      this.path = path;
       file = new RandomAccessFile(path.toFile(), "rw");
       file.setLength(0);
     }
@@ -90,9 +94,11 @@ public final class BoundedMemoryDemo {
     @Override
     public void complete() {}
 
+    /** Like an aborted upload, leaves no object behind. */
     @Override
     public void abort() throws IOException {
-      file.setLength(0);
+      file.close();
+      Files.deleteIfExists(path);
     }
 
     @Override

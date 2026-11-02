@@ -4,31 +4,44 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
-/** In-memory {@link MultipartUpload} that checks S3's part rules and assembles the object. */
+/**
+ * In-memory {@link MultipartUpload} that checks S3's part rules and assembles the object. Like the
+ * AWS SDK, it fails when called on an interrupted thread.
+ */
 final class MemoryUpload implements MultipartUpload {
   final Map<Integer, byte[]> parts = new TreeMap<>();
   final List<Integer> order = new ArrayList<>();
+  final Set<Thread> callers = new HashSet<>();
   boolean completed;
   boolean aborted;
+  /** If > 0, uploading this part number throws. */
+  int failOnPart;
 
   @Override
-  public void uploadPart(int partNumber, byte[] data, int length) {
+  public synchronized void uploadPart(int partNumber, byte[] data, int length) throws IOException {
+    enter();
     if (completed || aborted) {
       throw new IllegalStateException("upload already ended");
     }
     if (partNumber < 1 || partNumber > 10_000 || parts.containsKey(partNumber)) {
       throw new IllegalStateException("bad part number " + partNumber);
     }
+    if (partNumber == failOnPart) {
+      throw new IOException("simulated failure of part " + partNumber);
+    }
     parts.put(partNumber, Arrays.copyOf(data, length)); // data is reused by the caller
     order.add(partNumber);
   }
 
   @Override
-  public void complete() {
+  public synchronized void complete() throws IOException {
+    enter();
     if (completed || aborted) {
       throw new IllegalStateException("upload already ended");
     }
@@ -36,12 +49,20 @@ final class MemoryUpload implements MultipartUpload {
   }
 
   @Override
-  public void abort() {
+  public synchronized void abort() throws IOException {
+    enter();
     aborted = true;
   }
 
+  private void enter() throws IOException {
+    callers.add(Thread.currentThread());
+    if (Thread.currentThread().isInterrupted()) {
+      throw new IOException("called on an interrupted thread (the AWS SDK would fail here)");
+    }
+  }
+
   /** The completed object; checks parts are contiguous and all but the last have equal size. */
-  byte[] object() throws IOException {
+  synchronized byte[] object() throws IOException {
     if (!completed) {
       throw new IllegalStateException("not completed");
     }

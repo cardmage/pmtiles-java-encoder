@@ -215,7 +215,7 @@ class PmtilesWriterTest {
               PmtilesWriter.builder()
                   .tempDirectory(dir)
                   .sortChunkEntries(1000)
-                  .open(up, partSize)) {
+                  .openMultipart(up, partSize, 0)) {
             for (long id : ids) {
               w.writeTileId(id, id % 7 == 0 ? new byte[] {7} : content(id));
             }
@@ -240,19 +240,77 @@ class PmtilesWriterTest {
     try {
       MemoryUpload up = new MemoryUpload();
       try (PmtilesWriter w =
-          PmtilesWriter.builder().tempDirectory(dir).open(up, Header.ROOT_REGION + 1)) {
-        byte[] padding = new byte[8192]; // 341 tiles x 8 KiB overflows the 1 MiB write buffer
+          PmtilesWriter.builder()
+              .tempDirectory(dir)
+              .openMultipart(up, Header.ROOT_REGION + 1, 0)) {
+        byte[] padding = new byte[8192];
         for (long id : idsUpTo(4)) {
           w.writeTileId(id, concat(content(id), padding));
         }
-        assertFalse(up.parts.isEmpty(), "parts are uploaded while tiles are written");
       }
+      // only two part buffers exist, so most of the ~170 parts were uploaded before close()
+      assertFalse(up.parts.isEmpty(), "parts are uploaded while tiles are written");
       assertTrue(up.aborted);
       assertFalse(up.completed);
       assertNoTempFilesLeft(dir);
+    } finally {
+      deleteTree(dir);
+    }
+  }
+
+  @Test
+  void multipartOpenFailureAbortsTheUpload() throws IOException {
+    Path dir = tempDir();
+    try {
+      MemoryUpload tooSmall = new MemoryUpload();
       assertThrows(
           IllegalArgumentException.class,
-          () -> PmtilesWriter.builder().open(new MemoryUpload(), Header.ROOT_REGION));
+          () -> PmtilesWriter.builder().open(tooSmall, PmtilesWriter.MIN_PART_SIZE - 1));
+      assertTrue(tooSmall.aborted, "S3 minimum part size is enforced before uploading anything");
+
+      MemoryUpload tooLarge = new MemoryUpload();
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> PmtilesWriter.builder().open(tooLarge, PmtilesWriter.MAX_PART_SIZE + 1));
+      assertTrue(tooLarge.aborted);
+
+      MemoryUpload noTempDir = new MemoryUpload();
+      assertThrows(
+          IOException.class,
+          () ->
+              PmtilesWriter.builder()
+                  .tempDirectory(dir.resolve("missing"))
+                  .open(noTempDir, PmtilesWriter.MIN_PART_SIZE));
+      assertTrue(noTempDir.aborted);
+      assertTrue(noTempDir.parts.isEmpty());
+    } finally {
+      deleteTree(dir);
+    }
+  }
+
+  @Test
+  void failedPartUploadFailsTheWriterAndAbortsOnClose() throws IOException {
+    Path dir = tempDir();
+    try {
+      MemoryUpload up = new MemoryUpload();
+      up.failOnPart = 3;
+      PmtilesWriter w =
+          PmtilesWriter.builder().tempDirectory(dir).openMultipart(up, Header.ROOT_REGION + 1, 0);
+      IOException e =
+          assertThrows(
+              IOException.class,
+              () -> {
+                for (long id : idsUpTo(7)) {
+                  w.writeTileId(id, content(id));
+                }
+                w.finish();
+              });
+      assertTrue(e.getMessage().contains("part 3"), e.getMessage());
+      assertThrows(IllegalStateException.class, () -> w.write(0, 0, 0, new byte[] {1}));
+      w.close();
+      assertTrue(up.aborted);
+      assertFalse(up.completed);
+      assertNoTempFilesLeft(dir);
     } finally {
       deleteTree(dir);
     }
@@ -277,7 +335,7 @@ class PmtilesWriterTest {
           MemoryUpload up = new MemoryUpload();
           PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir);
           WriteResult res;
-          try (PmtilesWriter w = multipart ? b.open(up, PART_SIZE) : b.open(out)) {
+          try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
             for (long id : ids) {
               w.writeTileId(id, (id - start) % 100 == 0 ? content(id) : ocean);
             }
@@ -319,7 +377,7 @@ class PmtilesWriterTest {
               .tempDirectory(dir)
               .sortChunkEntries(1000)
               .dedupCacheEntries(0)
-              .open(up, PART_SIZE)) {
+              .openMultipart(up, PART_SIZE, 0)) {
         for (long id : ids) {
           w.writeTileId(id, content(id));
         }
@@ -396,7 +454,7 @@ class PmtilesWriterTest {
           PmtilesWriter.builder()
               .tempDirectory(dir)
               .internalCompression(Compression.NONE)
-              .open(up, PART_SIZE)) {
+              .openMultipart(up, PART_SIZE, 0)) {
         for (long id : idsUpTo(4)) {
           w.writeTileId(id, content(id));
         }
@@ -498,12 +556,20 @@ class PmtilesWriterTest {
 
   @Test
   void concurrentWritersProduceCompleteArchive() throws Exception {
+    for (boolean multipart : new boolean[] {false, true}) {
+      concurrentWriters(multipart);
+    }
+  }
+
+  private void concurrentWriters(boolean multipart) throws Exception {
     Path dir = tempDir();
     ExecutorService pool = Executors.newFixedThreadPool(4);
     try {
       Path out = dir.resolve("out.pmtiles");
       List<Long> ids = idsUpTo(8);
-      try (PmtilesWriter w = PmtilesWriter.builder().sortChunkEntries(5000).open(out)) {
+      MemoryUpload up = new MemoryUpload();
+      PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir).sortChunkEntries(5000);
+      try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
         List<Future<?>> futures = new ArrayList<>();
         for (int t = 0; t < 4; t++) {
           int shard = t;
@@ -522,7 +588,7 @@ class PmtilesWriterTest {
         }
         w.finish();
       }
-      TestReader r = new TestReader(out);
+      TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
       assertEquals(ids.size(), r.addressedTiles);
       assertAllTiles(r, ids);
     } finally {
@@ -544,7 +610,7 @@ class PmtilesWriterTest {
         Path out = dir.resolve("out.pmtiles");
         MemoryUpload up = new MemoryUpload();
         PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir);
-        try (PmtilesWriter w = multipart ? b.open(up, PART_SIZE) : b.open(out)) {
+        try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
           w.write(31, max, max, small);
           w.write(3, 1, 2, big);
           w.write(31, 0, 0, big); // dedup of a large tile
@@ -571,18 +637,22 @@ class PmtilesWriterTest {
       Path dir = tempDir();
       try {
         List<Long> ids = rowMajor(8); // unordered: exercises spills and merge
-        byte[] padding = new byte[4096]; // pushes data past the 1 MiB write buffer
+        byte[] padding = new byte[4096]; // pushes data past the 1 MiB file buffer
         Path out = dir.resolve("out.pmtiles");
         MemoryUpload up = new MemoryUpload();
         PmtilesWriter.Builder b = PmtilesWriter.builder().tempDirectory(dir).sortChunkEntries(500);
-        try (PmtilesWriter w = multipart ? b.open(up, PART_SIZE) : b.open(out)) {
+        try (PmtilesWriter w = multipart ? b.openMultipart(up, PART_SIZE, 0) : b.open(out)) {
           Thread.currentThread().interrupt(); // producer interrupted, e.g. a cancelled task
           for (long id : ids) {
             byte[] c = content(id);
             w.writeTileId(id, id % 1000 == 0 ? concat(c, padding) : c);
           }
+          w.finish(); // still interrupted: finish() must not fail either
           assertTrue(Thread.interrupted(), "interrupt flag preserved");
-          w.finish(); // documented: interrupting finish() itself may abort it
+        }
+        if (multipart) {
+          assertFalse(
+              up.callers.contains(Thread.currentThread()), "uploads never run on the producer");
         }
         TestReader r = multipart ? new TestReader(up.object()) : new TestReader(out);
         assertEquals(ids.size(), r.addressedTiles);

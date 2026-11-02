@@ -30,7 +30,7 @@ try (PmtilesWriter w = PmtilesWriter.builder()
 
 `finish()`를 호출하지 않고 `close()`되면(예: 루프 안에서 예외 발생) 미완성 출력을 폐기합니다. 파일은 지우고 multipart 업로드는 abort합니다. 헤더 없는 깨진 아카이브가 남지 않습니다.
 
-`write()`는 여러 스레드에서 동시에 호출해도 됩니다. 쓰기 경로는 `java.io`를 써서, 작업 취소 등으로 생산자 스레드가 interrupt돼도 아카이브가 망가지지 않습니다.
+`write()`는 여러 스레드에서 동시에 호출해도 됩니다. 작업 취소 등으로 생산자 스레드나 `finish()`를 부른 스레드가 interrupt돼도 아카이브가 망가지지 않습니다. 파일은 interrupt에 닫히지 않는 `java.io`로 쓰고, multipart 업로드는 라이브러리 전용 스레드에서 실행하기 때문입니다. interrupt 플래그는 그대로 유지됩니다.
 
 ### S3로 바로 업로드
 
@@ -66,8 +66,10 @@ try (PmtilesWriter w = PmtilesWriter.builder()
 ```
 
 - 파트 2, 3, …은 쓰는 동안 차는 대로 올라가고, 파트 1(헤더·루트·첫 타일들)은 `finish()`에서 마지막에 올라갑니다. S3는 파트 번호 순서로 조립하므로 업로드 순서는 상관없습니다.
-- 마지막 파트를 뺀 모든 파트는 정확히 `partSize` 바이트입니다. S3 파트 최소 크기는 5 MiB이고, 파트는 최대 10,000개라서 아카이브 최대 크기는 `10,000 × partSize`입니다.
-- 힙은 파트 2개분(`2 × partSize`)을 추가로 씁니다.
+- 마지막 파트를 뺀 모든 파트는 정확히 `partSize` 바이트입니다. `partSize`는 5 MiB(S3 최소)에서 1 GiB 사이여야 하며, 범위를 벗어나면 업로드를 시작하기 전에 거부합니다. 파트는 최대 10,000개라서 아카이브 최대 크기는 `10,000 × partSize`입니다.
+- 업로드는 라이브러리의 전용 스레드 하나가 순서대로 합니다. 생산자는 파트를 넘기기만 하므로 네트워크를 기다리지 않습니다. 단, 생성 속도가 업로드보다 빠르면 버퍼가 빌 때까지 기다립니다.
+- 힙은 파트 3개분(`3 × partSize`)을 추가로 씁니다. 파트 1은 끝까지 메모리에 남고, 나머지 두 버퍼가 번갈아 채워지고 업로드됩니다.
+- `open()`에 넘긴 `MultipartUpload`는 writer가 책임집니다. `finish()`가 `complete()`를 부르고, `finish()` 없이 `close()`되거나 `open()` 자체가 실패하면 `abort()`를 부릅니다. 파트 업로드가 실패하면 이후 `write()`/`finish()`가 `IOException`을 던집니다.
 - 결과 객체는 `open(Path)`로 쓴 파일과 바이트 단위로 같습니다.
 
 ### zstd / brotli 내부 압축
@@ -104,8 +106,8 @@ PMTiles는 헤더와 루트 디렉터리가 파일 맨 앞(첫 16 KiB)에 있어
 |---|---|---|
 | 엔트리 정렬 청크 | 최대 1,048,576개 × 24 B ≈ 24 MiB | `sortChunkEntries` |
 | 중복 제거 LRU | 100,000개 × 약 120 B ≈ 12 MiB | `dedupCacheEntries` (0이면 끔) |
-| 쓰기 버퍼 | 1 MiB | — |
-| multipart 파트 버퍼 | `2 × partSize` (multipart일 때만) | `open(upload, partSize)` |
+| 파일 쓰기 버퍼 | 1 MiB (로컬 파일일 때만) | — |
+| multipart 파트 버퍼 | `3 × partSize` (multipart일 때만) | `open(upload, partSize)` |
 | 병합 버퍼 | run당 64 KiB × 최대 128개 | — |
 | leaf 디렉터리 1개 | `n/3500`개 × 24 B (엔트리 10억 개당 약 7 MiB) | — |
 
@@ -162,8 +164,8 @@ Builder 옵션: `tileType`, `tileCompression`, `internalCompression`, `metadata`
 mvn test
 ```
 
-- 테스트 27개: 스펙의 tile ID 예시값, 디렉터리 바이트 단위 인코딩, 파일·multipart × 정렬/비정렬 입력, multipart 결과와 파일 결과의 바이트 일치(파트 1개·여러 개·최소 크기), 업로드 abort, 중복 제거 + RLE, leaf 디렉터리, 다단계 병합, 중복 타일 거부, 실패 시 정리, 동시 쓰기, interrupt된 생산자 스레드, 버퍼보다 큰 타일, z31 등.
-- 대용량: z0–12 전체(22,369,621 타일)를 multipart(8 MiB 파트) × Hilbert·row-major 순서로 `-Xmx64m`에서 기록했습니다. 파일 출력은 이전 버전에서 `-Xmx48m`으로 기록했고, 현재 버전의 파일 출력은 리팩터링 전과 바이트 단위로 같습니다(z0–10 확인).
+- 테스트 29개: 스펙의 tile ID 예시값, 디렉터리 바이트 단위 인코딩, 파일·multipart × 정렬/비정렬 입력, multipart 결과와 파일 결과의 바이트 일치(파트 1개·여러 개·최소 크기), 업로드 abort·열기 실패·파트 업로드 실패, 중복 제거 + RLE, leaf 디렉터리, 다단계 병합, 중복 타일 거부, 실패 시 정리, 동시 쓰기, interrupt된 생산자 스레드(`finish()` 포함, 업로드가 생산자 스레드에서 실행되지 않는지 확인), 버퍼보다 큰 타일, z31 등. 가짜 업로드는 AWS SDK처럼 interrupt된 스레드에서 호출되면 실패합니다.
+- 대용량: z0–12 전체(22,369,621 타일)를 multipart(5 MiB 파트) × Hilbert·row-major 순서로 `-Xmx64m`에서 기록했습니다. 파일 출력은 이전 버전에서 `-Xmx48m`으로 기록했고, 현재 버전의 파일 출력은 리팩터링 전과 바이트 단위로 같습니다(z0–10 확인).
   ```
   java -Xmx64m -cp target/classes:target/test-classes pmtiles.stream.BoundedMemoryDemo out.pmtiles 12 rowmajor multipart
   ```
