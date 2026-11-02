@@ -1,0 +1,4 @@
+target/
+*.pmtiles
+.idea/
+*.iml
